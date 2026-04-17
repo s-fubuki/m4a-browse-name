@@ -1,8 +1,8 @@
-;;; m4a-browse-name.el -- m4a file name browse title.
-;; Copyright (C) 2023, 2024, 2025 fubuki
+;;; m4a-browse-name.el -- m4a file name browse title. -*- lexical-binding:t -*-
+;; Copyright (C) 2023, 2024, 2025, 2026 fubuki
 
 ;; Author: fubuki at frill.org
-;; Version: @(#)$Revision: 1.22 $$Name:  $
+;; Version: @(#)$Revision: 1.25 $$Name:  $
 ;; Keywords: multimedia
 
 ;; This program is free software: you can redistribute it and/or modify
@@ -110,6 +110,14 @@
           (list regexp
                 (file :tag "Player" :must-match t)
                 (repeat :inline t :tag "Option" string)))
+  :group 'm4a-browse-name)
+
+(defcustom m4a-browse-cache-file
+  (if (executable-find "xz")
+      ".m4a-browse-cache.xz"
+    ".m4a-browse-cache.gz")
+  "Cache file name."
+  :type '(choice file (const :tag "Disable" nil))
   :group 'm4a-browse-name)
 
 (defgroup m4a-faces nil
@@ -318,14 +326,15 @@
 (defun m4a-browse-name (dir)
   "DIR 下にある \".m4a\" (or \".flac\")のタイトルの一覧を表示."
   (interactive "DDir: ")
-  (and (get-buffer m4a-buff-name) (kill-buffer m4a-buff-name))
-  (dired dir)
-  (setq m4a-dired-buffer (current-buffer))
-  (with-current-buffer (get-buffer-create m4a-buff-name)
-    (m4a-browse-name-mode)
-    (m4a-browse-name-refresh dir)
-    (tabulated-list-print t)
-    (pop-to-buffer (current-buffer))))
+  (let ((default-directory dir))
+    (and (get-buffer m4a-buff-name) (kill-buffer m4a-buff-name))
+    (dired default-directory)
+    (setq m4a-dired-buffer (current-buffer))
+    (with-current-buffer (get-buffer-create m4a-buff-name)
+      (m4a-browse-name-mode)
+      (m4a-browse-name-refresh default-directory)
+      (tabulated-list-print t)
+      (pop-to-buffer (current-buffer)))))
 
 (defun m4a-bitrate (id)
   (let ((tmp (nth 1 (plist-get id '*time))))
@@ -342,24 +351,64 @@ CAR には ID が CDR には ENTRY が入っている.
   (>  (car (plist-get (car ent1) '*time))
       (car (plist-get (car ent2) '*time))))
 
+(defvar m4a-browse-write-coding-system 'utf-8)
+
+(defun m4a-browse-read-list (file)
+  "List FILE を読み込みその値を返す.
+FILE が nil もしくは存在しなければ何もしないで nil を戻す."
+  (let (lst)
+    (and file (file-exists-p file)
+         (with-temp-buffer
+           (insert-file-contents file)
+           (condition-case err
+	       (setq lst (read (current-buffer)))
+	     (error (error "%s: `%s'" (error-message-string err) file))))
+         lst)))
+
+(defun m4a-browse-write-list (lst file)
+  "LST を FILE に書き出す. FILE が nil なら何もしない.
+コーディング・システムは `m4a-browse-write-coding-system' で指定.
+デフォルトは utf-8."
+  (let ((coding-system-for-write m4a-browse-write-coding-system))
+    (and file
+         (with-temp-buffer
+           (prin1 lst (current-buffer))
+           (write-region (point-min) (point-max) (expand-file-name file) nil 'silent)))))
+
+(defun m4a-browse-tag-read (file-attr cache-list)
+  (let* ((file (car file-attr))
+         (attr (cdr file-attr))
+         (size (file-attribute-size attr))
+         (read-size (round (* (/ size 100.0) 20)))
+         (time (file-attribute-modification-time attr))
+         (pos  (m4a-file-pos m4a-dired-buffer file))
+         (cache (catch 'out
+                  (dolist (c cache-list)
+                    (if (and (equal (plist-get c '*file) file)
+                             (eq (plist-get c '*size) size))
+                        (throw 'out c))))))
+    (if cache
+        (progn
+          (plist-put cache '*pos pos)
+          (plist-put cache '*mt time) ;; Just in case.
+          cache)
+      (append (list '*pos pos '*file file '*mt time '*size size)
+              (mf-tag-read-plist file read-size 'noimage)))))
+    
 (defun m4a-browse-name-refresh (&optional dir)
-  (let* ((buff m4a-dired-buffer)
-         (dir (or dir (with-current-buffer buff default-directory)))
+  (let* ((dir (or dir (with-current-buffer m4a-dired-buffer default-directory)))
          (files (directory-files-and-attributes dir t m4a-browse-name-regexp))
+         (cache (m4a-browse-read-list m4a-browse-cache-file))
          result entries)
     (m4a-entries-column-number)
     (unless tabulated-list-entries
       ;; Get tag data.
       (dolist (f files (message "done"))
-        (let ((name (car f))
-              (size (round (* (/ (file-attribute-size (cdr f)) 100.0) 20)))
-              (time (file-attribute-modification-time (cdr f)))
-              message-log-max)
-          (message "%s..." name)
-          (push
-           (append (list '*pos (m4a-file-pos buff name) '*file name '*mt time)
-                   (mf-tag-read-plist name size t))
-           result)))
+        (let* (message-log-max)
+          (message "%s..." (car f))
+          (push (m4a-browse-tag-read f cache) result)))
+      ;; Save or Update cache file.
+      (m4a-browse-write-list result m4a-browse-cache-file)
       ;; Set tabulated list.
       (dolist (rec result)
         (push
